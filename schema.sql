@@ -11,24 +11,34 @@ CREATE TABLE IF NOT EXISTS guild_config (
     admin_role_id BIGINT,
     analytics_enabled BOOLEAN NOT NULL DEFAULT TRUE,
     strict_ai_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    max_warnings_before_escalation INTEGER NOT NULL DEFAULT 5,
+    max_warnings INTEGER NOT NULL DEFAULT 5,
+    auto_reinforcement BOOLEAN NOT NULL DEFAULT TRUE,
+    threat_level INTEGER NOT NULL DEFAULT 0,
+    auto_lockdown BOOLEAN NOT NULL DEFAULT FALSE,
+    reinforcement_mode TEXT NOT NULL DEFAULT 'adaptive',
+    reinforcement_last_escalation TIMESTAMPTZ,
+    reinforcement_manual_override BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS infractions (
     id BIGSERIAL PRIMARY KEY,
-    case_id TEXT UNIQUE NOT NULL,
+    case_id TEXT UNIQUE,
     guild_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     moderator_id BIGINT,
     source TEXT NOT NULL DEFAULT 'ai',
-    category TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    action TEXT NOT NULL,
-    risk_score INTEGER NOT NULL,
+    category TEXT NOT NULL DEFAULT 'manual',
+    warning_type TEXT NOT NULL DEFAULT 'verbal',
+    severity TEXT NOT NULL DEFAULT 'medium',
+    action TEXT NOT NULL DEFAULT 'verbal',
+    risk_score INTEGER NOT NULL DEFAULT 0,
+    confidence DOUBLE PRECISION,
     ai_confidence DOUBLE PRECISION,
     reason TEXT NOT NULL,
-    explanation TEXT NOT NULL,
+    explanation TEXT NOT NULL DEFAULT '',
     active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ
@@ -68,6 +78,7 @@ CREATE TABLE IF NOT EXISTS moderator_actions (
 CREATE TABLE IF NOT EXISTS analytics_cache (
     guild_id BIGINT PRIMARY KEY,
     payload JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
