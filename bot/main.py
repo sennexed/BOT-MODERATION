@@ -2,45 +2,28 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
-from .anti_spam import AntiSpam
 from .cache import Cache
 from .config import Settings, load_settings
 from .database import Database
 from .groq_client import GroqClient
 from .moderation_engine import ModerationEngine
-from .reinforcement import ReinforcementEngine
-from .utils import Action, ModerationResult, Severity, setup_structured_logging
+from .utils import RecommendedAction, setup_structured_logging
 
 logger = logging.getLogger(__name__)
 
 
-def _action_rank(action: Action) -> int:
+def _risk_delta(action: RecommendedAction) -> float:
     return {
-        Action.NONE: 0,
-        Action.WARN: 1,
-        Action.DELETE: 2,
-        Action.TIMEOUT: 3,
-        Action.KICK: 4,
-        Action.BAN: 5,
+        RecommendedAction.NONE: 0.0,
+        RecommendedAction.VERBAL: 0.5,
+        RecommendedAction.TEMP: 2.0,
+        RecommendedAction.PERMANENT: 4.0,
     }[action]
-
-
-def _severity_base_action(severity: Severity) -> Action:
-    return {
-        Severity.SAFE: Action.NONE,
-        Severity.WARNING: Action.WARN,
-        Severity.TOXIC: Action.WARN,
-        Severity.NSFW: Action.DELETE,
-        Severity.SPAM: Action.DELETE,
-        Severity.SEVERE: Action.TIMEOUT,
-        Severity.HATE: Action.KICK,
-        Severity.THREAT: Action.BAN,
-    }[severity]
 
 
 class ModerationBot(commands.Bot):
@@ -53,20 +36,8 @@ class ModerationBot(commands.Bot):
         self.settings = settings
         self.db = Database(settings.database_url)
         self.cache = Cache(settings.redis_url)
-        self.groq = GroqClient(settings.groq_api_key, settings.groq_model, settings.moderation_timeout_seconds)
-        self.anti_spam = AntiSpam(
-            cache=self.cache,
-            spam_window_seconds=settings.spam_window_seconds,
-            spam_burst_count=settings.spam_burst_count,
-            raid_window_seconds=settings.raid_window_seconds,
-            raid_toxic_threshold=settings.raid_toxic_threshold,
-        )
-        self.reinforcement = ReinforcementEngine(
-            cache=self.cache,
-            db=self.db,
-            decay_per_hour=settings.risk_decay_per_hour,
-        )
-        self.moderation = ModerationEngine(settings, self.groq, self.cache, self.anti_spam)
+        self.groq = GroqClient(settings.groq_api_key, settings.groq_model, settings.groq_timeout_seconds)
+        self.moderation = ModerationEngine(settings, self.groq, self.cache)
 
     async def setup_hook(self) -> None:
         await self.db.connect()
@@ -82,175 +53,158 @@ class ModerationBot(commands.Bot):
         else:
             await self.tree.sync()
 
+        self.cleanup_expired_warnings.start()
+
     async def close(self) -> None:
+        self.cleanup_expired_warnings.cancel()
         await self.groq.close()
         await self.cache.close()
         await self.db.close()
         await super().close()
 
     async def on_ready(self) -> None:
-        logger.info("Bot connected as %s", self.user)
+        logger.info("Bot online as %s", self.user)
 
     async def on_message(self, message: discord.Message) -> None:
-        # Pipeline: analyze -> risk/reinforcement -> choose action -> execute -> persist log -> raid defense.
-        if not message.guild or not message.author or message.author.bot:
+        if not message.guild or not isinstance(message.author, discord.Member):
+            return
+        if message.author.bot:
             return
         if not message.content.strip():
             return
 
-        author = message.author
-        if isinstance(author, discord.Member) and (
-            author.guild_permissions.administrator or author.guild_permissions.manage_messages
-        ):
+        # Avoid moderating privileged members.
+        if message.author.guild_permissions.manage_messages or message.author.guild_permissions.administrator:
             return
 
-        result = await self.moderation.analyze_message(message.guild.id, author.id, message.content)
+        guild_id = message.guild.id
+        user_id = message.author.id
 
-        risk_score = await self.reinforcement.get_risk(message.guild.id, author.id)
-        if result.severity != Severity.SAFE:
-            risk_score = await self.reinforcement.apply_infraction(
-                message.guild.id, author.id, result.severity, len(result.bypass_flags)
-            )
+        if await self.cache.is_lockdown(guild_id):
+            if message.guild.me and message.channel.permissions_for(message.guild.me).manage_messages:
+                await message.delete()
+            return
 
-        previous_infractions = await self.db.get_user_infraction_count(message.guild.id, author.id)
-        action = self._determine_action(result, risk_score, previous_infractions)
-        executed_action = await self._apply_action(message, author, result, action)
-
-        await self.db.log_infraction(
-            {
-                "guild_id": message.guild.id,
-                "channel_id": message.channel.id,
-                "message_id": message.id,
-                "user_id": author.id,
-                "severity": result.severity.value,
-                "confidence": result.confidence,
-                "action_taken": executed_action.value,
-                "reasoning": result.reasoning,
-                "normalized_content": result.normalized_text,
-                "bypass_flags": result.bypass_flags,
-                "risk_score": risk_score,
-            }
-        )
-
-        if result.severity in {Severity.TOXIC, Severity.SEVERE, Severity.HATE, Severity.THREAT, Severity.SPAM}:
-            await self._maybe_trigger_lockdown(message, result)
-
-    def _determine_action(
-        self, result: ModerationResult, risk_score: float, previous_infractions: int
-    ) -> Action:
-        base = _severity_base_action(result.severity)
-        action = result.recommended_action if _action_rank(result.recommended_action) > _action_rank(base) else base
-
-        if risk_score >= self.settings.risk_ban_threshold:
-            action = Action.BAN
-        elif risk_score >= self.settings.risk_kick_threshold:
-            action = max(action, Action.KICK, key=_action_rank)
-        elif risk_score >= self.settings.risk_timeout_threshold:
-            action = max(action, Action.TIMEOUT, key=_action_rank)
-        elif risk_score >= self.settings.risk_delete_threshold:
-            action = max(action, Action.DELETE, key=_action_rank)
-        elif risk_score >= self.settings.risk_warn_threshold:
-            action = max(action, Action.WARN, key=_action_rank)
-
-        if previous_infractions >= 10:
-            action = max(action, Action.BAN, key=_action_rank)
-        elif previous_infractions >= 6:
-            action = max(action, Action.KICK, key=_action_rank)
-        elif previous_infractions >= 3:
-            action = max(action, Action.TIMEOUT, key=_action_rank)
-
-        return action
-
-    async def _apply_action(
-        self,
-        message: discord.Message,
-        member: discord.Member,
-        result: ModerationResult,
-        action: Action,
-    ) -> Action:
-        me = message.guild.me
-        if not me:
-            return Action.NONE
-
-        if action in {Action.KICK, Action.BAN, Action.TIMEOUT}:
-            if message.guild.owner_id == member.id or member.top_role >= me.top_role:
-                action = Action.DELETE if action in {Action.KICK, Action.BAN, Action.TIMEOUT} else action
+        confidence_threshold = await self.cache.get_sensitivity(guild_id, self.settings.default_sensitivity)
+        counts = await self.db.get_warning_counts(guild_id, user_id)
+        risk_score = await self.cache.get_risk_score(guild_id, user_id, self.settings.risk_decay_per_hour)
 
         try:
-            if action in {Action.DELETE, Action.TIMEOUT, Action.KICK, Action.BAN}:
-                if message.channel.permissions_for(me).manage_messages:
-                    await message.delete()
+            decision = await self.moderation.moderate_message(
+                guild_id=guild_id,
+                user_id=user_id,
+                content=message.content,
+                confidence_threshold=confidence_threshold,
+                active_temp_count=counts["temp"],
+                permanent_count=counts["permanent"],
+                risk_score=risk_score,
+            )
+        except Exception:
+            logger.exception("Moderation analysis failed")
+            return
 
-            if action == Action.WARN:
-                await message.channel.send(
-                    f"{member.mention} warning: {result.reasoning[:120]}",
-                    delete_after=10,
-                )
-                return Action.WARN
+        logger.info(
+            "ai_moderation guild=%s user=%s severity=%s confidence=%.3f action=%s reason=%s flags=%s",
+            guild_id,
+            user_id,
+            decision.severity.value,
+            decision.confidence,
+            decision.action.value,
+            decision.reasoning,
+            ",".join(decision.bypass_flags) if decision.bypass_flags else "none",
+        )
 
-            if action == Action.TIMEOUT and me.guild_permissions.moderate_members:
-                until = datetime.now(UTC) + timedelta(minutes=self.settings.default_timeout_minutes)
-                await member.edit(timed_out_until=until, reason=f"AI moderation: {result.severity.value}")
-                return Action.TIMEOUT
+        if decision.action == RecommendedAction.NONE:
+            await self.cache.increment_risk_score(guild_id, user_id, -0.05, self.settings.risk_decay_per_hour)
+            return
 
-            if action == Action.KICK and me.guild_permissions.kick_members:
-                await member.kick(reason=f"AI moderation: {result.severity.value}")
-                return Action.KICK
+        expires_at = None
+        warning_type = decision.action.value
+        if decision.action == RecommendedAction.TEMP:
+            expires_at = self.db.utcnow() + timedelta(days=self.settings.temp_warning_days)
 
-            if action == Action.BAN and me.guild_permissions.ban_members:
-                await member.ban(reason=f"AI moderation: {result.severity.value}", delete_message_seconds=3600)
-                return Action.BAN
+        await self.db.add_infraction(
+            guild_id=guild_id,
+            user_id=user_id,
+            warning_type=warning_type,
+            severity=decision.severity.value,
+            reason=decision.reasoning,
+            confidence=decision.confidence,
+            expires_at=expires_at,
+        )
 
-            if action == Action.DELETE:
-                return Action.DELETE
+        if decision.action == RecommendedAction.VERBAL:
+            await self._send_verbal_warning(message.author, decision.reasoning)
+        else:
+            if message.guild.me and message.channel.permissions_for(message.guild.me).manage_messages:
+                await message.delete()
 
-            return Action.NONE
-        except discord.Forbidden:
-            logger.warning("Permission denied while applying moderation action")
-            return Action.NONE
+        if decision.action == RecommendedAction.TEMP:
+            promoted = await self.db.promote_temp_to_permanent_if_needed(guild_id, user_id)
+            if promoted:
+                logger.info("temp_to_permanent_conversion guild=%s user=%s", guild_id, user_id)
+
+        permanent_count = await self.db.get_permanent_warning_count(guild_id, user_id)
+        if permanent_count >= 5:
+            await self._apply_auto_timeout(message.guild, message.author, permanent_count)
+
+        await self.cache.increment_risk_score(
+            guild_id,
+            user_id,
+            _risk_delta(decision.action),
+            self.settings.risk_decay_per_hour,
+        )
+
+    async def _send_verbal_warning(self, member: discord.Member, reason: str) -> None:
+        try:
+            await member.send(f"Verbal warning from moderation system: {reason[:300]}")
         except discord.HTTPException:
-            logger.exception("Discord API error while applying moderation action")
-            return Action.NONE
+            logger.info("Unable to DM verbal warning to user=%s", member.id)
 
-    async def _maybe_trigger_lockdown(self, message: discord.Message, result: ModerationResult) -> None:
-        # Anti-raid mode auto-locks the channel when toxic volume exceeds threshold/window.
-        if not await self.anti_spam.is_lockdown_enabled(message.guild.id):
+    async def _apply_auto_timeout(self, guild: discord.Guild, member: discord.Member, permanent_count: int) -> None:
+        me = guild.me
+        if me is None:
+            return
+        if not me.guild_permissions.moderate_members:
+            return
+        if guild.owner_id == member.id or member.top_role >= me.top_role:
+            logger.warning("Cannot timeout user due to role hierarchy guild=%s user=%s", guild.id, member.id)
             return
 
-        threshold, window = await self.anti_spam.get_raid_threshold(message.guild.id)
-
-        raid_detected = await self.anti_spam.mark_toxic_and_check_raid(
-            message.guild.id, message.channel.id, threshold=threshold, window=window
+        until = discord.utils.utcnow() + timedelta(hours=self.settings.timeout_hours)
+        reason = (
+            f"Automatic timeout: {permanent_count} permanent warnings "
+            f"(policy threshold: 5)"
         )
-        if not raid_detected:
-            return
+        try:
+            await member.timeout(until, reason=reason)
+            await self._notify_moderators(guild, f"Auto-timeout applied to {member.mention} for 48 hours ({permanent_count} permanent warnings).")
+            logger.info("auto_timeout guild=%s user=%s permanent_count=%s", guild.id, member.id, permanent_count)
+        except discord.HTTPException:
+            logger.exception("Failed to apply automatic timeout")
 
-        lock_key = f"lockdown:channel:{message.guild.id}:{message.channel.id}"
-        first_trigger = await self.cache.set_if_not_exists(lock_key, "1", ex=window)
-        if not first_trigger:
-            return
+    async def _notify_moderators(self, guild: discord.Guild, content: str) -> None:
+        channel = None
+        if self.settings.mod_alert_channel_id:
+            channel = guild.get_channel(self.settings.mod_alert_channel_id)
 
-        me = message.guild.me
-        if not me or not message.channel.permissions_for(me).manage_channels:
-            return
+        if channel is None:
+            channel = guild.system_channel
 
-        overwrite = message.channel.overwrites_for(message.guild.default_role)
-        overwrite.send_messages = False
-        await message.channel.set_permissions(
-            message.guild.default_role,
-            overwrite=overwrite,
-            reason="Anti-raid lockdown triggered",
-        )
-        await self.db.log_lockdown_event(
-            message.guild.id,
-            message.channel.id,
-            True,
-            f"Auto-lockdown: {threshold} toxic msgs/{window}s",
-        )
-        await message.channel.send(
-            "Channel temporarily locked due to raid detection. Moderators can restore permissions.",
-            delete_after=30,
-        )
+        if channel and isinstance(channel, discord.TextChannel):
+            try:
+                await channel.send(content)
+            except discord.HTTPException:
+                logger.warning("Failed to notify moderators in guild=%s", guild.id)
+
+    @tasks.loop(hours=24)
+    async def cleanup_expired_warnings(self) -> None:
+        removed = await self.db.cleanup_expired_temp_warnings()
+        logger.info("expired_temp_cleanup removed=%s", removed)
+
+    @cleanup_expired_warnings.before_loop
+    async def before_cleanup(self) -> None:
+        await self.wait_until_ready()
 
 
 def run() -> None:
@@ -266,7 +220,7 @@ def run() -> None:
     try:
         asyncio.run(_runner())
     except KeyboardInterrupt:
-        logger.info("Shutting down moderation bot")
+        logger.info("Shutdown requested")
 
 
 if __name__ == "__main__":

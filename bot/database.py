@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
@@ -15,158 +15,211 @@ class Database:
         self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=10)
 
     async def close(self) -> None:
-        if self._pool:
+        if self._pool is not None:
             await self._pool.close()
 
     @property
     def pool(self) -> asyncpg.Pool:
-        if not self._pool:
-            raise RuntimeError("Database is not connected")
+        if self._pool is None:
+            raise RuntimeError("Database not connected")
         return self._pool
 
     async def initialize_schema(self) -> None:
         query = """
         CREATE TABLE IF NOT EXISTS infractions (
-            id BIGSERIAL PRIMARY KEY,
+            id SERIAL PRIMARY KEY,
             guild_id BIGINT NOT NULL,
-            channel_id BIGINT NOT NULL,
-            message_id BIGINT,
             user_id BIGINT NOT NULL,
+            warning_type TEXT NOT NULL CHECK (warning_type IN ('verbal', 'temp', 'permanent')),
             severity TEXT NOT NULL,
-            confidence DOUBLE PRECISION NOT NULL,
-            action_taken TEXT NOT NULL,
-            reasoning TEXT NOT NULL,
-            normalized_content TEXT NOT NULL,
-            bypass_flags JSONB NOT NULL DEFAULT '[]'::jsonb,
-            risk_score DOUBLE PRECISION NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS user_risk (
-            guild_id BIGINT NOT NULL,
-            user_id BIGINT NOT NULL,
-            risk_score DOUBLE PRECISION NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (guild_id, user_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS lockdown_events (
-            id BIGSERIAL PRIMARY KEY,
-            guild_id BIGINT NOT NULL,
-            channel_id BIGINT NOT NULL,
-            enabled BOOLEAN NOT NULL,
             reason TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            confidence REAL NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at TIMESTAMPTZ NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_infractions_guild_user_time
             ON infractions (guild_id, user_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS appeals (
+            id SERIAL PRIMARY KEY,
+            guild_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            requested_by BIGINT NOT NULL,
+            note TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
         """
         async with self.pool.acquire() as conn:
             await conn.execute(query)
 
-    async def log_infraction(self, payload: dict[str, Any]) -> None:
+    async def add_infraction(
+        self,
+        guild_id: int,
+        user_id: int,
+        warning_type: str,
+        severity: str,
+        reason: str,
+        confidence: float,
+        expires_at: datetime | None = None,
+    ) -> None:
         query = """
-        INSERT INTO infractions (
-            guild_id, channel_id, message_id, user_id,
-            severity, confidence, action_taken, reasoning,
-            normalized_content, bypass_flags, risk_score
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        INSERT INTO infractions (guild_id, user_id, warning_type, severity, reason, confidence, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         """
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                query,
-                payload["guild_id"],
-                payload["channel_id"],
-                payload.get("message_id"),
-                payload["user_id"],
-                payload["severity"],
-                payload["confidence"],
-                payload["action_taken"],
-                payload["reasoning"],
-                payload["normalized_content"],
-                json.dumps(payload.get("bypass_flags", [])),
-                payload["risk_score"],
-            )
+            await conn.execute(query, guild_id, user_id, warning_type, severity, reason, confidence, expires_at)
 
-    async def get_user_infraction_count(self, guild_id: int, user_id: int, hours: int = 168) -> int:
+    async def get_warning_counts(self, guild_id: int, user_id: int) -> dict[str, int]:
         query = """
-        SELECT COUNT(*)
+        SELECT
+            COUNT(*) FILTER (WHERE warning_type = 'verbal') AS verbal_count,
+            COUNT(*) FILTER (WHERE warning_type = 'temp' AND (expires_at IS NULL OR expires_at > NOW())) AS active_temp_count,
+            COUNT(*) FILTER (WHERE warning_type = 'permanent') AS permanent_count
         FROM infractions
-        WHERE guild_id = $1
-          AND user_id = $2
-          AND created_at >= NOW() - ($3 || ' hours')::interval
-          AND severity <> 'SAFE'
+        WHERE guild_id = $1 AND user_id = $2
         """
         async with self.pool.acquire() as conn:
-            value = await conn.fetchval(query, guild_id, user_id, hours)
-        return int(value or 0)
+            row = await conn.fetchrow(query, guild_id, user_id)
+        return {
+            "verbal": int(row["verbal_count"]),
+            "temp": int(row["active_temp_count"]),
+            "permanent": int(row["permanent_count"]),
+        }
 
-    async def get_user_infractions(self, guild_id: int, user_id: int, limit: int = 20) -> list[asyncpg.Record]:
+    async def promote_temp_to_permanent_if_needed(self, guild_id: int, user_id: int) -> bool:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    """
+                    SELECT id
+                    FROM infractions
+                    WHERE guild_id = $1
+                      AND user_id = $2
+                      AND warning_type = 'temp'
+                      AND (expires_at IS NULL OR expires_at > NOW())
+                    ORDER BY created_at ASC
+                    LIMIT 4
+                    FOR UPDATE
+                    """,
+                    guild_id,
+                    user_id,
+                )
+                if len(rows) < 4:
+                    return False
+
+                ids = [row["id"] for row in rows]
+                await conn.execute("DELETE FROM infractions WHERE id = ANY($1::int[])", ids)
+                await conn.execute(
+                    """
+                    INSERT INTO infractions (guild_id, user_id, warning_type, severity, reason, confidence)
+                    VALUES ($1, $2, 'permanent', 'SEVERE', $3, $4)
+                    """,
+                    guild_id,
+                    user_id,
+                    "Auto escalation: 4 active temporary warnings converted into 1 permanent warning",
+                    1.0,
+                )
+                return True
+
+    async def get_recent_warnings(self, guild_id: int, user_id: int, limit: int = 25) -> list[asyncpg.Record]:
         query = """
-        SELECT created_at, severity, action_taken, confidence, reasoning
+        SELECT warning_type, severity, confidence, reason, created_at, expires_at
         FROM infractions
         WHERE guild_id = $1 AND user_id = $2
         ORDER BY created_at DESC
         LIMIT $3
         """
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(query, guild_id, user_id, limit)
-        return rows
+            return await conn.fetch(query, guild_id, user_id, limit)
 
-    async def set_user_risk(self, guild_id: int, user_id: int, risk_score: float) -> None:
+    async def clear_temp_warnings(self, guild_id: int, user_id: int) -> int:
         query = """
-        INSERT INTO user_risk (guild_id, user_id, risk_score, updated_at)
-        VALUES ($1,$2,$3,NOW())
-        ON CONFLICT (guild_id, user_id)
-        DO UPDATE SET risk_score = EXCLUDED.risk_score, updated_at = NOW()
+        DELETE FROM infractions
+        WHERE guild_id = $1
+          AND user_id = $2
+          AND warning_type = 'temp'
+          AND (expires_at IS NULL OR expires_at > NOW())
         """
         async with self.pool.acquire() as conn:
-            await conn.execute(query, guild_id, user_id, risk_score)
+            status = await conn.execute(query, guild_id, user_id)
+        return int(status.split()[-1])
 
-    async def get_user_risk(self, guild_id: int, user_id: int) -> float:
-        query = "SELECT risk_score FROM user_risk WHERE guild_id = $1 AND user_id = $2"
+    async def reset_all_warnings(self, guild_id: int, user_id: int) -> int:
+        query = "DELETE FROM infractions WHERE guild_id = $1 AND user_id = $2"
         async with self.pool.acquire() as conn:
-            value = await conn.fetchval(query, guild_id, user_id)
-        return float(value or 0.0)
+            status = await conn.execute(query, guild_id, user_id)
+        return int(status.split()[-1])
 
-    async def clear_user_risk(self, guild_id: int, user_id: int) -> None:
-        query = "DELETE FROM user_risk WHERE guild_id = $1 AND user_id = $2"
+    async def cleanup_expired_temp_warnings(self) -> int:
+        query = "DELETE FROM infractions WHERE warning_type = 'temp' AND expires_at <= NOW()"
         async with self.pool.acquire() as conn:
-            await conn.execute(query, guild_id, user_id)
+            status = await conn.execute(query)
+        return int(status.split()[-1])
 
     async def get_mod_stats(self, guild_id: int) -> dict[str, Any]:
-        query = """
+        totals_query = """
         SELECT
             COUNT(*) AS total,
-            COUNT(*) FILTER (WHERE severity <> 'SAFE') AS violations,
+            COUNT(*) FILTER (WHERE warning_type = 'verbal') AS verbal,
+            COUNT(*) FILTER (WHERE warning_type = 'temp') AS temp,
+            COUNT(*) FILTER (WHERE warning_type = 'permanent') AS permanent,
             COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') AS last_24h
         FROM infractions
         WHERE guild_id = $1
         """
-        severity_query = """
-        SELECT severity, COUNT(*) AS count
+        top_query = """
+        SELECT user_id, COUNT(*) AS warnings
         FROM infractions
         WHERE guild_id = $1
-        GROUP BY severity
-        ORDER BY count DESC
+        GROUP BY user_id
+        ORDER BY warnings DESC
+        LIMIT 5
         """
         async with self.pool.acquire() as conn:
-            totals = await conn.fetchrow(query, guild_id)
-            severities = await conn.fetch(severity_query, guild_id)
+            totals = await conn.fetchrow(totals_query, guild_id)
+            top_users = await conn.fetch(top_query, guild_id)
 
-        by_severity = {row["severity"]: int(row["count"]) for row in severities}
         return {
             "total": int(totals["total"]),
-            "violations": int(totals["violations"]),
+            "verbal": int(totals["verbal"]),
+            "temp": int(totals["temp"]),
+            "permanent": int(totals["permanent"]),
             "last_24h": int(totals["last_24h"]),
-            "by_severity": by_severity,
+            "top_users": [(int(row["user_id"]), int(row["warnings"])) for row in top_users],
         }
 
-    async def log_lockdown_event(self, guild_id: int, channel_id: int, enabled: bool, reason: str) -> None:
+    async def create_appeal(self, guild_id: int, user_id: int, requested_by: int, note: str) -> None:
         query = """
-        INSERT INTO lockdown_events (guild_id, channel_id, enabled, reason)
-        VALUES ($1,$2,$3,$4)
+        INSERT INTO appeals (guild_id, user_id, requested_by, note)
+        VALUES ($1, $2, $3, $4)
         """
         async with self.pool.acquire() as conn:
-            await conn.execute(query, guild_id, channel_id, enabled, reason)
+            await conn.execute(query, guild_id, user_id, requested_by, note)
+
+    async def get_permanent_warning_count(self, guild_id: int, user_id: int) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM infractions
+        WHERE guild_id = $1 AND user_id = $2 AND warning_type = 'permanent'
+        """
+        async with self.pool.acquire() as conn:
+            value = await conn.fetchval(query, guild_id, user_id)
+        return int(value or 0)
+
+    async def get_active_temp_warning_count(self, guild_id: int, user_id: int) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM infractions
+        WHERE guild_id = $1
+          AND user_id = $2
+          AND warning_type = 'temp'
+          AND (expires_at IS NULL OR expires_at > NOW())
+        """
+        async with self.pool.acquire() as conn:
+            value = await conn.fetchval(query, guild_id, user_id)
+        return int(value or 0)
+
+    @staticmethod
+    def utcnow() -> datetime:
+        return datetime.now(UTC)

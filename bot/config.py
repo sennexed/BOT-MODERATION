@@ -15,21 +15,17 @@ class Settings:
     database_url: str
     redis_url: str
     log_level: str
-    moderation_timeout_seconds: float
-    user_llm_cooldown_seconds: int
-    llm_rate_limit_per_minute: int
-    spam_window_seconds: int
-    spam_burst_count: int
-    raid_window_seconds: int
-    raid_toxic_threshold: int
-    default_timeout_minutes: int
+    groq_timeout_seconds: float
+    groq_rate_limit_per_minute: int
+    default_confidence_threshold: float
+    default_sensitivity: float
     risk_decay_per_hour: float
-    risk_warn_threshold: float
-    risk_delete_threshold: float
-    risk_timeout_threshold: float
-    risk_kick_threshold: float
-    risk_ban_threshold: float
+    risk_temp_threshold: float
+    risk_permanent_threshold: float
+    temp_warning_days: int
+    timeout_hours: int
     command_guild_id: Optional[int]
+    mod_alert_channel_id: Optional[int]
 
 
 def _required(name: str) -> str:
@@ -49,6 +45,13 @@ def _float(name: str, default: float) -> float:
     return float(value) if value is not None else default
 
 
+def _optional_int(name: str) -> Optional[int]:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return None
+    return int(value)
+
+
 def load_settings() -> Settings:
     load_dotenv()
 
@@ -59,26 +62,24 @@ def load_settings() -> Settings:
         database_url=_required("DATABASE_URL"),
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0").strip(),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper().strip(),
-        moderation_timeout_seconds=_float("MODERATION_TIMEOUT_SECONDS", 8.0),
-        user_llm_cooldown_seconds=_int("USER_LLM_COOLDOWN_SECONDS", 3),
-        llm_rate_limit_per_minute=_int("LLM_RATE_LIMIT_PER_MINUTE", 20),
-        spam_window_seconds=_int("SPAM_WINDOW_SECONDS", 8),
-        spam_burst_count=_int("SPAM_BURST_COUNT", 6),
-        raid_window_seconds=_int("RAID_WINDOW_SECONDS", 15),
-        raid_toxic_threshold=_int("RAID_TOXIC_THRESHOLD", 5),
-        default_timeout_minutes=_int("DEFAULT_TIMEOUT_MINUTES", 30),
-        risk_decay_per_hour=_float("RISK_DECAY_PER_HOUR", 1.5),
-        risk_warn_threshold=_float("RISK_WARN_THRESHOLD", 3.0),
-        risk_delete_threshold=_float("RISK_DELETE_THRESHOLD", 5.0),
-        risk_timeout_threshold=_float("RISK_TIMEOUT_THRESHOLD", 8.0),
-        risk_kick_threshold=_float("RISK_KICK_THRESHOLD", 12.0),
-        risk_ban_threshold=_float("RISK_BAN_THRESHOLD", 16.0),
-        command_guild_id=int(os.getenv("COMMAND_GUILD_ID", "0")) or None,
+        groq_timeout_seconds=_float("GROQ_TIMEOUT_SECONDS", 3.0),
+        groq_rate_limit_per_minute=_int("GROQ_RATE_LIMIT_PER_MINUTE", 15),
+        default_confidence_threshold=_float("DEFAULT_CONFIDENCE_THRESHOLD", 0.65),
+        default_sensitivity=_float("DEFAULT_SENSITIVITY", 0.65),
+        risk_decay_per_hour=_float("RISK_DECAY_PER_HOUR", 0.3),
+        risk_temp_threshold=_float("RISK_TEMP_THRESHOLD", 4.0),
+        risk_permanent_threshold=_float("RISK_PERMANENT_THRESHOLD", 8.0),
+        temp_warning_days=_int("TEMP_WARNING_DAYS", 30),
+        timeout_hours=_int("TIMEOUT_HOURS", 48),
+        command_guild_id=_optional_int("COMMAND_GUILD_ID"),
+        mod_alert_channel_id=_optional_int("MOD_ALERT_CHANNEL_ID"),
     )
 
-    if settings.risk_decay_per_hour < 0:
-        raise ValueError("RISK_DECAY_PER_HOUR must be >= 0")
-    if settings.spam_burst_count < 2:
-        raise ValueError("SPAM_BURST_COUNT must be >= 2")
+    if not 0 <= settings.default_confidence_threshold <= 1:
+        raise ValueError("DEFAULT_CONFIDENCE_THRESHOLD must be between 0 and 1")
+    if not 0 <= settings.default_sensitivity <= 1:
+        raise ValueError("DEFAULT_SENSITIVITY must be between 0 and 1")
+    if settings.groq_timeout_seconds <= 0:
+        raise ValueError("GROQ_TIMEOUT_SECONDS must be > 0")
 
     return settings
