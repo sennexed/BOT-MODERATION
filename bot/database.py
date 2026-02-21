@@ -4,8 +4,25 @@ from typing import Optional, Dict, Any
 
 
 class Database:
-    def __init__(self, pool: asyncpg.Pool):
-        self.pool = pool
+    def __init__(self, dsn: str):
+        self.dsn = dsn
+        self.pool: Optional[asyncpg.Pool] = None
+
+    # =========================
+    # CONNECTION MANAGEMENT
+    # =========================
+
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(
+            dsn=self.dsn,
+            min_size=1,
+            max_size=10
+        )
+        await self.initialize_schema()
+
+    async def close(self):
+        if self.pool:
+            await self.pool.close()
 
     # =========================
     # INITIALIZATION
@@ -36,7 +53,6 @@ class Database:
             );
             """)
 
-            # Safe column migrations
             await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS ai_sensitivity FLOAT DEFAULT 0.6;")
             await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS confidence_threshold FLOAT DEFAULT 0.7;")
             await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS strict_ai_enabled BOOLEAN DEFAULT FALSE;")
@@ -76,7 +92,6 @@ class Database:
             );
             """)
 
-            # Safe migration
             await conn.execute("ALTER TABLE appeals ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending';")
 
             await conn.execute("""
