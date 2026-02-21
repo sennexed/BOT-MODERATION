@@ -21,12 +21,19 @@ class Database:
             min_size=1,
             max_size=10
         )
+
         await self.initialize_schema()
 
     async def close(self):
         if self.pool:
             await self.pool.close()
             self.pool = None
+
+    async def init_schema(self):
+        """
+        Compatibility method required by main.py
+        """
+        await self.initialize_schema()
 
     # =========================
     # INITIALIZATION
@@ -57,7 +64,6 @@ class Database:
             );
             """)
 
-            # Safe column migrations
             await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS ai_sensitivity FLOAT DEFAULT 0.6;")
             await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS confidence_threshold FLOAT DEFAULT 0.7;")
             await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS strict_ai_enabled BOOLEAN DEFAULT FALSE;")
@@ -97,7 +103,9 @@ class Database:
             );
             """)
 
-            await conn.execute("ALTER TABLE appeals ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending';")
+            await conn.execute(
+                "ALTER TABLE appeals ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending';"
+            )
 
             await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_appeals_guild_status
@@ -134,6 +142,7 @@ class Database:
                     "INSERT INTO guild_config (guild_id) VALUES ($1)",
                     guild_id
                 )
+
                 row = await conn.fetchrow(
                     "SELECT * FROM guild_config WHERE guild_id = $1",
                     guild_id
@@ -201,7 +210,7 @@ class Database:
             return None
 
     # =========================
-    # CLEANUP
+    # CLEANUP / AUTO EXPIRE
     # =========================
 
     async def cleanup_expired_infractions(self):
@@ -222,6 +231,6 @@ class Database:
 
     async def auto_expire_old_cases(self):
         """
-        Alias used by main.py background task.
+        Alias required by main.py background task
         """
         return await self.cleanup_expired_infractions()
