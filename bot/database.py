@@ -24,16 +24,14 @@ class Database:
             raise RuntimeError("Database not connected")
         return self._pool
 
-    # ✅ STRICT ERROR FIX APPLIED HERE
     async def initialize_schema(self) -> None:
         async with self.pool.acquire() as conn:
-            # Create table if it does not exist
             await conn.execute("""
             CREATE TABLE IF NOT EXISTS infractions (
                 id SERIAL PRIMARY KEY,
                 guild_id BIGINT NOT NULL,
                 user_id BIGINT NOT NULL,
-                warning_type TEXT,
+                warning_type TEXT NOT NULL,
                 severity TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 confidence REAL NOT NULL,
@@ -42,7 +40,6 @@ class Database:
             );
             """)
 
-            # 🔥 Strict fix: ensure missing columns are added for old schema
             await conn.execute("""
             ALTER TABLE infractions
             ADD COLUMN IF NOT EXISTS warning_type TEXT;
@@ -53,7 +50,6 @@ class Database:
             ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
             """)
 
-            # Ensure appeals table exists
             await conn.execute("""
             CREATE TABLE IF NOT EXISTS appeals (
                 id SERIAL PRIMARY KEY,
@@ -80,13 +76,25 @@ class Database:
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         """
         async with self.pool.acquire() as conn:
-            await conn.execute(query, guild_id, user_id, warning_type, severity, reason, confidence, expires_at)
+            await conn.execute(
+                query,
+                guild_id,
+                user_id,
+                warning_type,
+                severity,
+                reason,
+                confidence,
+                expires_at,
+            )
 
     async def get_warning_counts(self, guild_id: int, user_id: int) -> dict[str, int]:
         query = """
         SELECT
             COUNT(*) FILTER (WHERE warning_type = 'verbal') AS verbal_count,
-            COUNT(*) FILTER (WHERE warning_type = 'temp' AND (expires_at IS NULL OR expires_at > NOW())) AS active_temp_count,
+            COUNT(*) FILTER (
+                WHERE warning_type = 'temp'
+                AND (expires_at IS NULL OR expires_at > NOW())
+            ) AS active_temp_count,
             COUNT(*) FILTER (WHERE warning_type = 'permanent') AS permanent_count
         FROM infractions
         WHERE guild_id = $1 AND user_id = $2
@@ -112,17 +120,20 @@ class Database:
 
         return int(status.split()[-1])
 
-<<<<<<< HEAD
-=======
     async def get_mod_stats(self, guild_id: int) -> dict[str, Any]:
         totals_query = """
         SELECT
             COUNT(*) AS total,
             COUNT(*) FILTER (WHERE warning_type = 'verbal') AS verbal,
             COUNT(*) FILTER (WHERE warning_type = 'temp') AS temp,
-            COUNT(*) FILTER (WHERE warning_type = 'temp' AND (expires_at IS NULL OR expires_at > NOW())) AS active_temp,
+            COUNT(*) FILTER (
+                WHERE warning_type = 'temp'
+                AND (expires_at IS NULL OR expires_at > NOW())
+            ) AS active_temp,
             COUNT(*) FILTER (WHERE warning_type = 'permanent') AS permanent,
-            COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') AS last_24h
+            COUNT(*) FILTER (
+                WHERE created_at >= NOW() - INTERVAL '24 hours'
+            ) AS last_24h
         FROM infractions
         WHERE guild_id = $1
         """
@@ -139,16 +150,25 @@ class Database:
             top_users = await conn.fetch(top_query, guild_id)
 
         return {
-            "total": int(totals["total"]),
-            "verbal": int(totals["verbal"]),
-            "temp": int(totals["temp"]),
-            "active_temp": int(totals["active_temp"]),
-            "permanent": int(totals["permanent"]),
-            "last_24h": int(totals["last_24h"]),
-            "top_users": [(int(row["user_id"]), int(row["warnings"])) for row in top_users],
+            "total": int(totals["total"] or 0),
+            "verbal": int(totals["verbal"] or 0),
+            "temp": int(totals["temp"] or 0),
+            "active_temp": int(totals["active_temp"] or 0),
+            "permanent": int(totals["permanent"] or 0),
+            "last_24h": int(totals["last_24h"] or 0),
+            "top_users": [
+                (int(row["user_id"]), int(row["warnings"]))
+                for row in top_users
+            ],
         }
 
-    async def create_appeal(self, guild_id: int, user_id: int, requested_by: int, note: str) -> None:
+    async def create_appeal(
+        self,
+        guild_id: int,
+        user_id: int,
+        requested_by: int,
+        note: str,
+    ) -> None:
         query = """
         INSERT INTO appeals (guild_id, user_id, requested_by, note)
         VALUES ($1, $2, $3, $4)
@@ -156,17 +176,27 @@ class Database:
         async with self.pool.acquire() as conn:
             await conn.execute(query, guild_id, user_id, requested_by, note)
 
-    async def get_permanent_warning_count(self, guild_id: int, user_id: int) -> int:
+    async def get_permanent_warning_count(
+        self,
+        guild_id: int,
+        user_id: int,
+    ) -> int:
         query = """
         SELECT COUNT(*)
         FROM infractions
-        WHERE guild_id = $1 AND user_id = $2 AND warning_type = 'permanent'
+        WHERE guild_id = $1
+          AND user_id = $2
+          AND warning_type = 'permanent'
         """
         async with self.pool.acquire() as conn:
             value = await conn.fetchval(query, guild_id, user_id)
         return int(value or 0)
 
-    async def get_active_temp_warning_count(self, guild_id: int, user_id: int) -> int:
+    async def get_active_temp_warning_count(
+        self,
+        guild_id: int,
+        user_id: int,
+    ) -> int:
         query = """
         SELECT COUNT(*)
         FROM infractions
@@ -179,7 +209,6 @@ class Database:
             value = await conn.fetchval(query, guild_id, user_id)
         return int(value or 0)
 
->>>>>>> 73c3111 (Initial premium AI moderation bot release)
     @staticmethod
     def utcnow() -> datetime:
         return datetime.now(UTC)
