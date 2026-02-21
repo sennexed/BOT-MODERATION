@@ -9,7 +9,7 @@ class Database:
         self.pool: Optional[asyncpg.Pool] = None
 
     # =========================
-    # CONNECTION MANAGEMENT
+    # CONNECTION
     # =========================
 
     async def connect(self):
@@ -30,13 +30,10 @@ class Database:
             self.pool = None
 
     async def init_schema(self):
-        """
-        Compatibility method required by main.py
-        """
         await self.initialize_schema()
 
     # =========================
-    # INITIALIZATION
+    # SCHEMA
     # =========================
 
     async def initialize_schema(self):
@@ -45,41 +42,67 @@ class Database:
 
         async with self.pool.acquire() as conn:
 
-            # -------------------------
-            # GUILD CONFIG
-            # -------------------------
+            # =========================
+            # GUILD CONFIG (FULL ENTERPRISE SCHEMA)
+            # =========================
+
             await conn.execute("""
             CREATE TABLE IF NOT EXISTS guild_config (
                 guild_id BIGINT PRIMARY KEY,
-                ai_sensitivity FLOAT DEFAULT 0.6,
-                confidence_threshold FLOAT DEFAULT 0.7,
+
+                -- AI Core
+                ai_sensitivity FLOAT DEFAULT 0.5,
+                confidence_threshold FLOAT DEFAULT 0.6,
                 strict_ai_enabled BOOLEAN DEFAULT FALSE,
-                raid_mode TEXT DEFAULT 'off',
-                auto_reinforcement BOOLEAN DEFAULT FALSE,
-                auto_lockdown BOOLEAN DEFAULT FALSE,
-                max_warnings INTEGER DEFAULT 3,
+                ai_strict_mode BOOLEAN DEFAULT FALSE,
+                ai_shadow_mode BOOLEAN DEFAULT FALSE,
+
+                -- Security
+                raid_mode TEXT DEFAULT 'auto',
+                escalation_temp_days INTEGER DEFAULT 3,
+                max_warnings_before_escalation INTEGER DEFAULT 5,
+
+                -- Roles & Logging
                 log_channel_id BIGINT,
                 mod_role_id BIGINT,
-                created_at TIMESTAMP DEFAULT NOW()
+                admin_role_id BIGINT,
+
+                -- Reinforcement
+                auto_reinforcement BOOLEAN DEFAULT TRUE,
+                threat_level INTEGER DEFAULT 0,
+                auto_lockdown BOOLEAN DEFAULT FALSE,
+                reinforcement_mode TEXT DEFAULT 'adaptive',
+                reinforcement_last_escalation TIMESTAMPTZ,
+                reinforcement_manual_override BOOLEAN DEFAULT FALSE,
+
+                -- Analytics
+                analytics_enabled BOOLEAN DEFAULT TRUE,
+
+                -- Meta
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
             );
             """)
 
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS ai_sensitivity FLOAT DEFAULT 0.6;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS confidence_threshold FLOAT DEFAULT 0.7;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS strict_ai_enabled BOOLEAN DEFAULT FALSE;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS raid_mode TEXT DEFAULT 'off';")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS auto_reinforcement BOOLEAN DEFAULT FALSE;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS auto_lockdown BOOLEAN DEFAULT FALSE;")
+            # Safe migrations
+            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS ai_strict_mode BOOLEAN DEFAULT FALSE;")
+            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS ai_shadow_mode BOOLEAN DEFAULT FALSE;")
+            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS escalation_temp_days INTEGER DEFAULT 3;")
+            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS admin_role_id BIGINT;")
+            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS analytics_enabled BOOLEAN DEFAULT TRUE;")
+            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();")
+            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS max_warnings_before_escalation INTEGER DEFAULT 5;")
 
-            # -------------------------
+            # =========================
             # INFRACTIONS
-            # -------------------------
+            # =========================
+
             await conn.execute("""
             CREATE TABLE IF NOT EXISTS infractions (
                 id SERIAL PRIMARY KEY,
                 guild_id BIGINT NOT NULL,
                 user_id BIGINT NOT NULL,
-                warning_type TEXT,
+                action TEXT,
                 severity INTEGER,
                 reason TEXT,
                 confidence FLOAT,
@@ -88,9 +111,10 @@ class Database:
             );
             """)
 
-            # -------------------------
+            # =========================
             # APPEALS
-            # -------------------------
+            # =========================
+
             await conn.execute("""
             CREATE TABLE IF NOT EXISTS appeals (
                 id SERIAL PRIMARY KEY,
@@ -103,18 +127,15 @@ class Database:
             );
             """)
 
-            await conn.execute(
-                "ALTER TABLE appeals ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending';"
-            )
-
             await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_appeals_guild_status
             ON appeals (guild_id, status);
             """)
 
-            # -------------------------
+            # =========================
             # ANALYTICS CACHE
-            # -------------------------
+            # =========================
+
             await conn.execute("""
             CREATE TABLE IF NOT EXISTS analytics_cache (
                 guild_id BIGINT PRIMARY KEY,
@@ -122,60 +143,6 @@ class Database:
                 updated_at TIMESTAMP DEFAULT NOW()
             );
             """)
-
-    # =========================
-    # GUILD CONFIG METHODS
-    # =========================
-
-    async def get_or_create_guild_config(self, guild_id: int):
-        if not self.pool:
-            raise RuntimeError("Database not connected")
-
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT * FROM guild_config WHERE guild_id = $1",
-                guild_id
-            )
-
-            if not row:
-                await conn.execute(
-                    "INSERT INTO guild_config (guild_id) VALUES ($1)",
-                    guild_id
-                )
-
-                row = await conn.fetchrow(
-                    "SELECT * FROM guild_config WHERE guild_id = $1",
-                    guild_id
-                )
-
-            return row
-
-    async def update_guild_config(self, guild_id: int, **kwargs):
-        if not self.pool:
-            raise RuntimeError("Database not connected")
-
-        if not kwargs:
-            return
-
-        columns = []
-        values = []
-        index = 1
-
-        for key, value in kwargs.items():
-            columns.append(f"{key} = ${index}")
-            values.append(value)
-            index += 1
-
-        query = f"""
-        UPDATE guild_config
-        SET {', '.join(columns)}
-        WHERE guild_id = ${index}
-        """
-
-        values.append(guild_id)
-
-        async with self.pool.acquire() as conn:
-            await conn.execute(query, *values)
 
     # =========================
     # ANALYTICS CACHE
@@ -210,7 +177,7 @@ class Database:
             return None
 
     # =========================
-    # CLEANUP / AUTO EXPIRE
+    # CLEANUP
     # =========================
 
     async def cleanup_expired_infractions(self):
@@ -230,7 +197,4 @@ class Database:
                 return 0
 
     async def auto_expire_old_cases(self):
-        """
-        Alias required by main.py background task
-        """
         return await self.cleanup_expired_infractions()
