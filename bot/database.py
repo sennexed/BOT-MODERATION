@@ -13,6 +13,9 @@ class Database:
     # =========================
 
     async def connect(self):
+        if self.pool:
+            return
+
         self.pool = await asyncpg.create_pool(
             dsn=self.dsn,
             min_size=1,
@@ -23,15 +26,16 @@ class Database:
     async def close(self):
         if self.pool:
             await self.pool.close()
+            self.pool = None
 
     # =========================
     # INITIALIZATION
     # =========================
 
-    async def init_schema(self):
-        await self.initialize_schema()
-
     async def initialize_schema(self):
+        if not self.pool:
+            raise RuntimeError("Database not connected")
+
         async with self.pool.acquire() as conn:
 
             # -------------------------
@@ -53,6 +57,7 @@ class Database:
             );
             """)
 
+            # Safe column migrations
             await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS ai_sensitivity FLOAT DEFAULT 0.6;")
             await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS confidence_threshold FLOAT DEFAULT 0.7;")
             await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS strict_ai_enabled BOOLEAN DEFAULT FALSE;")
@@ -115,6 +120,9 @@ class Database:
     # =========================
 
     async def get_or_create_guild_config(self, guild_id: int):
+        if not self.pool:
+            raise RuntimeError("Database not connected")
+
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM guild_config WHERE guild_id = $1",
@@ -134,6 +142,9 @@ class Database:
             return row
 
     async def update_guild_config(self, guild_id: int, **kwargs):
+        if not self.pool:
+            raise RuntimeError("Database not connected")
+
         if not kwargs:
             return
 
@@ -162,6 +173,9 @@ class Database:
     # =========================
 
     async def cache_analytics(self, guild_id: int, payload: Dict[str, Any]):
+        if not self.pool:
+            raise RuntimeError("Database not connected")
+
         async with self.pool.acquire() as conn:
             await conn.execute("""
             INSERT INTO analytics_cache (guild_id, payload)
@@ -172,13 +186,18 @@ class Database:
             """, guild_id, json.dumps(payload))
 
     async def get_server_analytics(self, guild_id: int):
+        if not self.pool:
+            raise RuntimeError("Database not connected")
+
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT payload FROM analytics_cache WHERE guild_id = $1",
                 guild_id
             )
+
             if row:
                 return json.loads(row["payload"])
+
             return None
 
     # =========================
@@ -186,9 +205,23 @@ class Database:
     # =========================
 
     async def cleanup_expired_infractions(self):
+        if not self.pool:
+            raise RuntimeError("Database not connected")
+
         async with self.pool.acquire() as conn:
-            return await conn.execute("""
-            DELETE FROM infractions
-            WHERE expires_at IS NOT NULL
-            AND expires_at < NOW();
+            result = await conn.execute("""
+                DELETE FROM infractions
+                WHERE expires_at IS NOT NULL
+                AND expires_at < NOW();
             """)
+
+            try:
+                return int(result.split(" ")[1])
+            except (IndexError, ValueError):
+                return 0
+
+    async def auto_expire_old_cases(self):
+        """
+        Alias used by main.py background task.
+        """
+        return await self.cleanup_expired_infractions()
