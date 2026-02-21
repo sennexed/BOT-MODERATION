@@ -80,3 +80,32 @@ class Cache:
     async def is_lockdown(self, guild_id: int) -> bool:
         value = await self._redis.get(f"config:lockdown:{guild_id}")
         return value == "1"
+
+    async def set_ai_enabled(self, guild_id: int, enabled: bool) -> None:
+        await self._redis.set(f"config:ai_enabled:{guild_id}", "1" if enabled else "0")
+
+    async def get_ai_enabled(self, guild_id: int) -> bool:
+        value = await self._redis.get(f"config:ai_enabled:{guild_id}")
+        if value is None:
+            return True
+        return value == "1"
+
+    async def set_raid_settings(self, guild_id: int, threshold: int, window_seconds: int) -> None:
+        await self._redis.set(f"config:raid_threshold:{guild_id}", str(max(1, threshold)))
+        await self._redis.set(f"config:raid_window:{guild_id}", str(max(1, window_seconds)))
+
+    async def get_raid_settings(self, guild_id: int) -> tuple[int, int]:
+        threshold_val = await self._redis.get(f"config:raid_threshold:{guild_id}")
+        window_val = await self._redis.get(f"config:raid_window:{guild_id}")
+
+        try:
+            threshold = int(threshold_val) if threshold_val is not None else 8
+        except ValueError:
+            threshold = 8
+
+        try:
+            window_seconds = int(window_val) if window_val is not None else 20
+        except ValueError:
+            window_seconds = 20
+
+        return max(1, threshold), max(1, window_seconds)

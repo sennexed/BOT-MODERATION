@@ -45,6 +45,7 @@ class ModerationBot(commands.Bot):
 
         await self.load_extension("bot.cogs.moderation_commands")
         await self.load_extension("bot.cogs.admin_commands")
+        await self.load_extension("bot.cogs.moderation_panel")
 
         if self.settings.command_guild_id:
             guild = discord.Object(id=self.settings.command_guild_id)
@@ -79,6 +80,9 @@ class ModerationBot(commands.Bot):
 
         guild_id = message.guild.id
         user_id = message.author.id
+
+        if not await self.cache.get_ai_enabled(guild_id):
+            return
 
         if await self.cache.is_lockdown(guild_id):
             if message.guild.me and message.channel.permissions_for(message.guild.me).manage_messages:

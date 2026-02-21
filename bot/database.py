@@ -112,6 +112,74 @@ class Database:
 
         return int(status.split()[-1])
 
+<<<<<<< HEAD
+=======
+    async def get_mod_stats(self, guild_id: int) -> dict[str, Any]:
+        totals_query = """
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE warning_type = 'verbal') AS verbal,
+            COUNT(*) FILTER (WHERE warning_type = 'temp') AS temp,
+            COUNT(*) FILTER (WHERE warning_type = 'temp' AND (expires_at IS NULL OR expires_at > NOW())) AS active_temp,
+            COUNT(*) FILTER (WHERE warning_type = 'permanent') AS permanent,
+            COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') AS last_24h
+        FROM infractions
+        WHERE guild_id = $1
+        """
+        top_query = """
+        SELECT user_id, COUNT(*) AS warnings
+        FROM infractions
+        WHERE guild_id = $1
+        GROUP BY user_id
+        ORDER BY warnings DESC
+        LIMIT 5
+        """
+        async with self.pool.acquire() as conn:
+            totals = await conn.fetchrow(totals_query, guild_id)
+            top_users = await conn.fetch(top_query, guild_id)
+
+        return {
+            "total": int(totals["total"]),
+            "verbal": int(totals["verbal"]),
+            "temp": int(totals["temp"]),
+            "active_temp": int(totals["active_temp"]),
+            "permanent": int(totals["permanent"]),
+            "last_24h": int(totals["last_24h"]),
+            "top_users": [(int(row["user_id"]), int(row["warnings"])) for row in top_users],
+        }
+
+    async def create_appeal(self, guild_id: int, user_id: int, requested_by: int, note: str) -> None:
+        query = """
+        INSERT INTO appeals (guild_id, user_id, requested_by, note)
+        VALUES ($1, $2, $3, $4)
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(query, guild_id, user_id, requested_by, note)
+
+    async def get_permanent_warning_count(self, guild_id: int, user_id: int) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM infractions
+        WHERE guild_id = $1 AND user_id = $2 AND warning_type = 'permanent'
+        """
+        async with self.pool.acquire() as conn:
+            value = await conn.fetchval(query, guild_id, user_id)
+        return int(value or 0)
+
+    async def get_active_temp_warning_count(self, guild_id: int, user_id: int) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM infractions
+        WHERE guild_id = $1
+          AND user_id = $2
+          AND warning_type = 'temp'
+          AND (expires_at IS NULL OR expires_at > NOW())
+        """
+        async with self.pool.acquire() as conn:
+            value = await conn.fetchval(query, guild_id, user_id)
+        return int(value or 0)
+
+>>>>>>> 73c3111 (Initial premium AI moderation bot release)
     @staticmethod
     def utcnow() -> datetime:
         return datetime.now(UTC)
