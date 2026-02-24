@@ -1,6 +1,7 @@
 import asyncpg
 import json
 from typing import Optional, Dict, Any
+from datetime import datetime, UTC
 
 
 class Database:
@@ -22,102 +23,70 @@ class Database:
             max_size=10
         )
 
-        await self.initialize_schema()
+        await self.init_schema()
 
     async def close(self):
         if self.pool:
             await self.pool.close()
             self.pool = None
 
+    def now(self):
+        return datetime.now(UTC)
+
     # =========================
     # SCHEMA
     # =========================
 
-    async def initialize_schema(self):
-        if not self.pool:
-            raise RuntimeError("Database not connected")
-
+    async def init_schema(self):
         async with self.pool.acquire() as conn:
 
-            # Guild config table
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS guild_config (
                     guild_id BIGINT PRIMARY KEY,
                     ai_sensitivity FLOAT DEFAULT 0.5,
                     confidence_threshold FLOAT DEFAULT 0.6,
                     strict_ai_enabled BOOLEAN DEFAULT FALSE,
-                    ai_strict_mode BOOLEAN DEFAULT FALSE,
                     ai_shadow_mode BOOLEAN DEFAULT FALSE,
                     raid_mode TEXT DEFAULT 'auto',
                     escalation_temp_days INTEGER DEFAULT 3,
-                    max_warnings_before_escalation INTEGER DEFAULT 5,
                     log_channel_id BIGINT,
-                    mod_role_id BIGINT,
-                    admin_role_id BIGINT,
-                    auto_reinforcement BOOLEAN DEFAULT TRUE,
-                    threat_level INTEGER DEFAULT 0,
-                    auto_lockdown BOOLEAN DEFAULT FALSE,
-                    reinforcement_mode TEXT DEFAULT 'adaptive',
-                    reinforcement_last_escalation TIMESTAMPTZ,
-                    reinforcement_manual_override BOOLEAN DEFAULT FALSE,
-                    analytics_enabled BOOLEAN DEFAULT TRUE,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW()
+                    created_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
 
-            # Infractions
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS infractions (
                     id SERIAL PRIMARY KEY,
-                    guild_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    warning_type TEXT,
+                    case_id TEXT,
+                    guild_id BIGINT,
+                    user_id BIGINT,
                     action TEXT,
-                    severity INTEGER,
+                    severity TEXT,
+                    category TEXT,
+                    risk_score INTEGER,
+                    ai_confidence FLOAT,
                     reason TEXT,
-                    confidence FLOAT,
-                    expires_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT NOW()
+                    explanation TEXT,
+                    expires_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
 
-            # Appeals
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS appeals (
-                    id SERIAL PRIMARY KEY,
-                    guild_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    infraction_id INTEGER,
-                    reason TEXT,
-                    status TEXT DEFAULT 'pending',
-                    created_at TIMESTAMP DEFAULT NOW()
-                );
-            """)
-
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_appeals_guild_status
-                ON appeals (guild_id, status);
-            """)
-
-            # User risk
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_risk (
-                    guild_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
+                    guild_id BIGINT,
+                    user_id BIGINT,
                     risk_score FLOAT DEFAULT 0,
-                    warning_count INTEGER DEFAULT 0,
-                    last_updated TIMESTAMP DEFAULT NOW(),
+                    last_updated TIMESTAMPTZ DEFAULT NOW(),
                     PRIMARY KEY (guild_id, user_id)
                 );
             """)
 
-            # Analytics cache
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS analytics_cache (
                     guild_id BIGINT PRIMARY KEY,
                     payload JSONB,
-                    updated_at TIMESTAMP DEFAULT NOW()
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
 
@@ -127,12 +96,10 @@ class Database:
 
     async def get_or_create_guild_config(self, guild_id: int):
         async with self.pool.acquire() as conn:
-
             row = await conn.fetchrow(
                 "SELECT * FROM guild_config WHERE guild_id = $1",
                 guild_id
             )
-
             if row:
                 return dict(row)
 
@@ -145,17 +112,80 @@ class Database:
                 "SELECT * FROM guild_config WHERE guild_id = $1",
                 guild_id
             )
-
             return dict(row)
 
+    async def update_guild_config(self, guild_id: int, **fields):
+        async with self.pool.acquire() as conn:
+            for key, value in fields.items():
+                await conn.execute(
+                    f"UPDATE guild_config SET {key} = $1 WHERE guild_id = $2",
+                    value,
+                    guild_id
+                )
+
     # =========================
-    # RISK SYSTEM
+    # INFRACTIONS
+    # =========================
+
+    async def create_infraction(self, **data):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO infractions
+                (case_id, guild_id, user_id, action, severity, category,
+                 risk_score, ai_confidence, reason, explanation, expires_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            """,
+                data["case_id"],
+                data["guild_id"],
+                data["user_id"],
+                data["action"],
+                data["severity"],
+                data["category"],
+                data["risk_score"],
+                data["ai_confidence"],
+                data["reason"],
+                data["explanation"],
+                data["expires_at"]
+            )
+
+    async def get_user_infraction_counts(self, guild_id: int, user_id: int):
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT action FROM infractions
+                WHERE guild_id = $1 AND user_id = $2
+            """, guild_id, user_id)
+
+        verbal = sum(1 for r in rows if r["action"] == "verbal")
+        temp = sum(1 for r in rows if r["action"] == "temp")
+        permanent = sum(1 for r in rows if r["action"] == "permanent")
+
+        return {
+            "verbal": verbal,
+            "temp": temp,
+            "permanent": permanent,
+            "recent": len(rows)
+        }
+
+    async def cleanup_expired_infractions(self):
+        async with self.pool.acquire() as conn:
+            result = await conn.execute("""
+                DELETE FROM infractions
+                WHERE expires_at IS NOT NULL
+                AND expires_at < NOW()
+            """)
+            return int(result.split(" ")[1])
+
+    async def auto_expire_old_cases(self):
+        return await self.cleanup_expired_infractions()
+
+    # =========================
+    # RISK
     # =========================
 
     async def get_risk_row(self, guild_id: int, user_id: int):
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("""
-                SELECT risk_score, warning_count
+                SELECT risk_score, last_updated
                 FROM user_risk
                 WHERE guild_id = $1 AND user_id = $2
             """, guild_id, user_id)
@@ -168,41 +198,21 @@ class Database:
                 VALUES ($1, $2)
             """, guild_id, user_id)
 
-            return {"risk_score": 0.0, "warning_count": 0}
+            return {"risk_score": 0.0, "last_updated": None}
 
-    async def update_risk(self, guild_id: int, user_id: int, risk_delta: float, warning_increment: int = 0):
+    async def upsert_risk(self, guild_id: int, user_id: int, new_score: float):
         async with self.pool.acquire() as conn:
             await conn.execute("""
-                INSERT INTO user_risk (guild_id, user_id, risk_score, warning_count)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO user_risk (guild_id, user_id, risk_score, last_updated)
+                VALUES ($1, $2, $3, NOW())
                 ON CONFLICT (guild_id, user_id)
                 DO UPDATE SET
-                    risk_score = user_risk.risk_score + $3,
-                    warning_count = user_risk.warning_count + $4,
-                    last_updated = NOW();
-            """, guild_id, user_id, risk_delta, warning_increment)
+                    risk_score = $3,
+                    last_updated = NOW()
+            """, guild_id, user_id, new_score)
 
     # =========================
-    # CLEANUP
-    # =========================
-
-    async def cleanup_expired_infractions(self):
-        async with self.pool.acquire() as conn:
-            result = await conn.execute("""
-                DELETE FROM infractions
-                WHERE expires_at IS NOT NULL
-                AND expires_at < NOW();
-            """)
-            try:
-                return int(result.split(" ")[1])
-            except:
-                return 0
-
-    async def auto_expire_old_cases(self):
-        return await self.cleanup_expired_infractions()
-
-    # =========================
-    # ANALYTICS CACHE
+    # ANALYTICS
     # =========================
 
     async def cache_analytics(self, guild_id: int, payload: Dict[str, Any]):
@@ -212,8 +222,8 @@ class Database:
                 VALUES ($1, $2)
                 ON CONFLICT (guild_id)
                 DO UPDATE SET payload = EXCLUDED.payload,
-                              updated_at = NOW();
-            """, guild_id, json.dumps(payload))
+                              updated_at = NOW()
+            """, guild_id, json.dumps(payload or {}))
 
     async def get_server_analytics(self, guild_id: int):
         async with self.pool.acquire() as conn:
@@ -221,6 +231,4 @@ class Database:
                 "SELECT payload FROM analytics_cache WHERE guild_id = $1",
                 guild_id
             )
-            if row:
-                return json.loads(row["payload"])
-            return None
+            return json.loads(row["payload"]) if row else {}
