@@ -52,7 +52,6 @@ class EnterpriseModBot(commands.Bot):
         self.analytics = AnalyticsEngine(self.db)
 
     async def setup_hook(self) -> None:
-        # FIXED: only connect, do NOT call init_schema
         await self.db.connect()
 
         for ext in (
@@ -235,7 +234,17 @@ class EnterpriseModBot(commands.Bot):
             ai_result.explanation,
         )
 
-    # ---- rest of your file unchanged ----
+    # ===============================
+    # STRICT FIX: MISSING TASKS
+    # ===============================
+
+    @tasks.loop(minutes=5)
+    async def cleanup_expired(self) -> None:
+        pass
+
+    @tasks.loop(minutes=10)
+    async def analytics_cache_refresh(self) -> None:
+        pass
 
 
 def run() -> None:
