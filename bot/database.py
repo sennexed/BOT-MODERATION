@@ -46,6 +46,35 @@ class Database:
             # GUILD CONFIG
             # =========================
 
+async def get_or_create_guild_config(self, guild_id: int):
+    if not self.pool:
+        raise RuntimeError("Database not connected")
+
+    async with self.pool.acquire() as conn:
+
+        row = await conn.fetchrow("""
+            SELECT *
+            FROM guild_config
+            WHERE guild_id = $1
+        """, guild_id)
+
+        if row:
+            return dict(row)
+
+        # Insert default config if not exists
+        await conn.execute("""
+            INSERT INTO guild_config (guild_id)
+            VALUES ($1)
+        """, guild_id)
+
+        row = await conn.fetchrow("""
+            SELECT *
+            FROM guild_config
+            WHERE guild_id = $1
+        """, guild_id)
+
+        return dict(row)
+
             await conn.execute("""
             CREATE TABLE IF NOT EXISTS guild_config (
                 guild_id BIGINT PRIMARY KEY
