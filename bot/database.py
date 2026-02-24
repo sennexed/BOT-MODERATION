@@ -29,11 +29,8 @@ class Database:
             await self.pool.close()
             self.pool = None
 
-    async def init_schema(self):
-        await self.initialize_schema()
-
     # =========================
-    # SCHEMA (HARDENED)
+    # SCHEMA
     # =========================
 
     async def initialize_schema(self):
@@ -42,135 +39,114 @@ class Database:
 
         async with self.pool.acquire() as conn:
 
-            # =========================
-            # GUILD CONFIG
-            # =========================
+            # Guild config table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS guild_config (
+                    guild_id BIGINT PRIMARY KEY,
+                    ai_sensitivity FLOAT DEFAULT 0.5,
+                    confidence_threshold FLOAT DEFAULT 0.6,
+                    strict_ai_enabled BOOLEAN DEFAULT FALSE,
+                    ai_strict_mode BOOLEAN DEFAULT FALSE,
+                    ai_shadow_mode BOOLEAN DEFAULT FALSE,
+                    raid_mode TEXT DEFAULT 'auto',
+                    escalation_temp_days INTEGER DEFAULT 3,
+                    max_warnings_before_escalation INTEGER DEFAULT 5,
+                    log_channel_id BIGINT,
+                    mod_role_id BIGINT,
+                    admin_role_id BIGINT,
+                    auto_reinforcement BOOLEAN DEFAULT TRUE,
+                    threat_level INTEGER DEFAULT 0,
+                    auto_lockdown BOOLEAN DEFAULT FALSE,
+                    reinforcement_mode TEXT DEFAULT 'adaptive',
+                    reinforcement_last_escalation TIMESTAMPTZ,
+                    reinforcement_manual_override BOOLEAN DEFAULT FALSE,
+                    analytics_enabled BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
 
-async def get_or_create_guild_config(self, guild_id: int):
-    if not self.pool:
-        raise RuntimeError("Database not connected")
+            # Infractions
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS infractions (
+                    id SERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    warning_type TEXT,
+                    action TEXT,
+                    severity INTEGER,
+                    reason TEXT,
+                    confidence FLOAT,
+                    expires_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
 
-    async with self.pool.acquire() as conn:
+            # Appeals
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS appeals (
+                    id SERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    infraction_id INTEGER,
+                    reason TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
 
-        row = await conn.fetchrow("""
-            SELECT *
-            FROM guild_config
-            WHERE guild_id = $1
-        """, guild_id)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_appeals_guild_status
+                ON appeals (guild_id, status);
+            """)
 
-        if row:
+            # User risk
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_risk (
+                    guild_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    risk_score FLOAT DEFAULT 0,
+                    warning_count INTEGER DEFAULT 0,
+                    last_updated TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, user_id)
+                );
+            """)
+
+            # Analytics cache
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS analytics_cache (
+                    guild_id BIGINT PRIMARY KEY,
+                    payload JSONB,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+
+    # =========================
+    # GUILD CONFIG
+    # =========================
+
+    async def get_or_create_guild_config(self, guild_id: int):
+        async with self.pool.acquire() as conn:
+
+            row = await conn.fetchrow(
+                "SELECT * FROM guild_config WHERE guild_id = $1",
+                guild_id
+            )
+
+            if row:
+                return dict(row)
+
+            await conn.execute(
+                "INSERT INTO guild_config (guild_id) VALUES ($1)",
+                guild_id
+            )
+
+            row = await conn.fetchrow(
+                "SELECT * FROM guild_config WHERE guild_id = $1",
+                guild_id
+            )
+
             return dict(row)
-
-        # Insert default config if not exists
-        await conn.execute("""
-            INSERT INTO guild_config (guild_id)
-            VALUES ($1)
-        """, guild_id)
-
-        row = await conn.fetchrow("""
-            SELECT *
-            FROM guild_config
-            WHERE guild_id = $1
-        """, guild_id)
-
-        return dict(row)
-
-            await conn.execute("""
-            CREATE TABLE IF NOT EXISTS guild_config (
-                guild_id BIGINT PRIMARY KEY
-            );
-            """)
-
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS ai_sensitivity FLOAT DEFAULT 0.5;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS confidence_threshold FLOAT DEFAULT 0.6;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS strict_ai_enabled BOOLEAN DEFAULT FALSE;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS ai_strict_mode BOOLEAN DEFAULT FALSE;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS ai_shadow_mode BOOLEAN DEFAULT FALSE;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS raid_mode TEXT DEFAULT 'auto';")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS escalation_temp_days INTEGER DEFAULT 3;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS max_warnings_before_escalation INTEGER DEFAULT 5;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS log_channel_id BIGINT;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS mod_role_id BIGINT;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS admin_role_id BIGINT;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS auto_reinforcement BOOLEAN DEFAULT TRUE;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS threat_level INTEGER DEFAULT 0;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS auto_lockdown BOOLEAN DEFAULT FALSE;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS reinforcement_mode TEXT DEFAULT 'adaptive';")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS reinforcement_last_escalation TIMESTAMPTZ;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS reinforcement_manual_override BOOLEAN DEFAULT FALSE;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS analytics_enabled BOOLEAN DEFAULT TRUE;")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();")
-            await conn.execute("ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();")
-
-            # =========================
-            # INFRACTIONS
-            # =========================
-
-            await conn.execute("""
-            CREATE TABLE IF NOT EXISTS infractions (
-                id SERIAL PRIMARY KEY,
-                guild_id BIGINT NOT NULL,
-                user_id BIGINT NOT NULL
-            );
-            """)
-
-            await conn.execute("ALTER TABLE infractions ADD COLUMN IF NOT EXISTS warning_type TEXT;")
-            await conn.execute("ALTER TABLE infractions ADD COLUMN IF NOT EXISTS action TEXT;")
-            await conn.execute("ALTER TABLE infractions ADD COLUMN IF NOT EXISTS severity INTEGER;")
-            await conn.execute("ALTER TABLE infractions ADD COLUMN IF NOT EXISTS reason TEXT;")
-            await conn.execute("ALTER TABLE infractions ADD COLUMN IF NOT EXISTS confidence FLOAT;")
-            await conn.execute("ALTER TABLE infractions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP;")
-            await conn.execute("ALTER TABLE infractions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();")
-
-            # =========================
-            # APPEALS
-            # =========================
-
-            await conn.execute("""
-            CREATE TABLE IF NOT EXISTS appeals (
-                id SERIAL PRIMARY KEY,
-                guild_id BIGINT NOT NULL,
-                user_id BIGINT NOT NULL
-            );
-            """)
-
-            await conn.execute("ALTER TABLE appeals ADD COLUMN IF NOT EXISTS infraction_id INTEGER;")
-            await conn.execute("ALTER TABLE appeals ADD COLUMN IF NOT EXISTS reason TEXT;")
-            await conn.execute("ALTER TABLE appeals ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending';")
-            await conn.execute("ALTER TABLE appeals ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();")
-
-            await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_appeals_guild_status
-            ON appeals (guild_id, status);
-            """)
-
-            # =========================
-            # USER RISK
-            # =========================
-
-            await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_risk (
-                guild_id BIGINT NOT NULL,
-                user_id BIGINT NOT NULL,
-                PRIMARY KEY (guild_id, user_id)
-            );
-            """)
-
-            await conn.execute("ALTER TABLE user_risk ADD COLUMN IF NOT EXISTS risk_score FLOAT DEFAULT 0;")
-            await conn.execute("ALTER TABLE user_risk ADD COLUMN IF NOT EXISTS warning_count INTEGER DEFAULT 0;")
-            await conn.execute("ALTER TABLE user_risk ADD COLUMN IF NOT EXISTS last_updated TIMESTAMP DEFAULT NOW();")
-
-            # =========================
-            # ANALYTICS CACHE
-            # =========================
-
-            await conn.execute("""
-            CREATE TABLE IF NOT EXISTS analytics_cache (
-                guild_id BIGINT PRIMARY KEY,
-                payload JSONB,
-                updated_at TIMESTAMP DEFAULT NOW()
-            );
-            """)
 
     # =========================
     # RISK SYSTEM
