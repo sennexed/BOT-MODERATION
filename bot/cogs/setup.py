@@ -354,8 +354,8 @@ class LogChannelSelect(discord.ui.ChannelSelect["ControlCenterView"]):
 
         channel = self.values[0]
 
-        # Ensure it's a valid text/news channel
-        if not isinstance(channel, (discord.TextChannel, discord.NewsChannel)):
+        # In discord.py 2.4+, announcement channels are TextChannel
+        if not isinstance(channel, discord.TextChannel):
             await self.view.set_notice_and_render(
                 interaction,
                 "Invalid channel type selected",
