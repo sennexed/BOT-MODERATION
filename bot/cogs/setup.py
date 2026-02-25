@@ -338,7 +338,10 @@ class LogChannelSelect(discord.ui.ChannelSelect["ControlCenterView"]):
     def __init__(self, current_channel_id: int | None) -> None:
         super().__init__(
             placeholder="Select logging channel",
-            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            channel_types=[
+                discord.ChannelType.text,
+                discord.ChannelType.news,
+            ],
             min_values=1,
             max_values=1,
             row=1,
@@ -348,12 +351,23 @@ class LogChannelSelect(discord.ui.ChannelSelect["ControlCenterView"]):
     async def callback(self, interaction: discord.Interaction) -> None:
         if self.view is None:
             return
-        channel = self.values[0]
-        if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel, discord.CategoryChannel)):
-            await self.view.set_notice_and_render(interaction, "Invalid channel type selected", ok=False)
-            return
-        await self.view.apply_update(interaction, {"log_channel_id": channel.id}, f"Logging channel updated to {channel.mention}")
 
+        channel = self.values[0]
+
+        # Ensure it's a valid text/news channel
+        if not isinstance(channel, (discord.TextChannel, discord.NewsChannel)):
+            await self.view.set_notice_and_render(
+                interaction,
+                "Invalid channel type selected",
+                ok=False,
+            )
+            return
+
+        await self.view.apply_update(
+            interaction,
+            {"log_channel_id": channel.id},
+            f"Logging channel updated to {channel.mention}",
+        )
 
 class ModRoleSelect(discord.ui.RoleSelect["ControlCenterView"]):
     def __init__(self, current_role_id: int | None) -> None:
